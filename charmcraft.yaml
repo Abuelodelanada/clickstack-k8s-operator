@@ -1,0 +1,140 @@
+# This file configures Charmcraft.
+# See https://documentation.ubuntu.com/charmcraft/stable/reference/files/charmcraft-yaml-file/
+type: charm
+name: clickstack-k8s
+title: ClickStack
+summary: ClickHouse's open-source observability stack, on Kubernetes.
+
+description: |
+  ClickStack is ClickHouse's open-source observability stack: an OpenTelemetry ingestion
+  pipeline, ClickHouse as the telemetry store, and the HyperDX UI for search, dashboards and
+  alerting.
+
+  This charm deploys ClickStack on Kubernetes from the upstream all-in-one image, which bundles
+  ClickHouse, the OpenTelemetry Collector, HyperDX and MongoDB in a single container. It exposes
+  OTLP endpoints on ports 4317 (gRPC) and 4318 (HTTP), the HyperDX UI on port 8080, and the
+  ClickHouse HTTP interface on port 8123. Telemetry, user accounts and dashboards are kept on
+  Juju-managed persistent volumes, so they survive pod rescheduling.
+
+  ClickStack can either use its own bundled ClickHouse, or be pointed at an external ClickHouse
+  (including ClickHouse Cloud) with the `clickhouse-endpoint` configuration option.
+
+  This charm is aimed at anyone who wants to evaluate ClickStack on Kubernetes with a single
+  `juju deploy`, and at Juju users who want an OTLP-native observability backend alongside their
+  existing models. Upstream does not recommend the all-in-one image for production workloads:
+  all four components share one container and one set of cgroup limits, and cannot be scaled
+  independently. See DESIGN.md for the roadmap towards a production-grade topology.
+
+links:
+  documentation: https://clickhouse.com/docs/clickstack
+  source: https://github.com/Abuelodelanada/clickstack-k8s-operator
+  issues: https://github.com/Abuelodelanada/clickstack-k8s-operator/issues
+  website: https://clickhouse.com/docs/clickstack
+
+# Documentation:
+# https://documentation.ubuntu.com/charmcraft/stable/howto/build-guides/select-platforms/
+base: ubuntu@24.04
+platforms:
+  amd64:
+  arm64:
+
+assumes:
+  - juju >= 3.6
+  - k8s-api
+
+parts:
+  charm:
+    plugin: uv
+    source: .
+    build-snaps:
+      - astral-uv
+
+config:
+  options:
+    external-url:
+      description: |
+        The URL that users will use to reach the HyperDX UI in a browser, without a trailing
+        slash, for example "https://clickstack.example.com".
+
+        HyperDX bakes this value into the links it generates (alert notifications, share links),
+        so it must be set to whatever address is actually reachable by your users once the
+        application is fronted by an ingress or load balancer.
+
+        When unset, the charm advertises the in-cluster Kubernetes Service address on the UI
+        port, which only works from inside the cluster.
+      type: string
+    clickhouse-endpoint:
+      description: |
+        HTTP(S) endpoint of an external ClickHouse to write telemetry to, including the port,
+        for example "https://abc123.us-east-2.aws.clickhouse.com:8443".
+
+        When set, the OpenTelemetry Collector exports to this ClickHouse instead of the bundled
+        one, and the HyperDX UI is seeded with a connection pointing at it. The bundled
+        ClickHouse still runs, but is unused; this is a limitation of the upstream all-in-one
+        image.
+
+        When unset, the bundled ClickHouse on localhost:8123 is used.
+      type: string
+    clickhouse-user:
+      description: |
+        Username to authenticate to the ClickHouse given by `clickhouse-endpoint`.
+
+        Ignored unless `clickhouse-endpoint` is set.
+      type: string
+      default: default
+    clickhouse-credentials:
+      description: |
+        A Juju user secret holding the password for `clickhouse-user`, as a single "password"
+        key. Create and grant it with:
+
+          juju add-secret clickhouse-creds password=<password>
+          juju grant-secret clickhouse-creds clickstack
+          juju config clickstack clickhouse-credentials=<secret-uri>
+
+        Ignored unless `clickhouse-endpoint` is set.
+      type: secret
+
+# Your workload's containers.
+# https://documentation.ubuntu.com/charmcraft/stable/reference/files/charmcraft-yaml-file/#containers
+containers:
+  clickstack:
+    resource: clickstack-image
+    mounts:
+      - storage: clickhouse-data
+        location: /var/lib/clickhouse
+      - storage: clickhouse-logs
+        location: /var/log/clickhouse-server
+      - storage: hyperdx-data
+        location: /data/db
+
+# Without these, a pod reschedule loses every ingested signal *and* every user account,
+# dashboard and alert. The three paths are the ones upstream documents as needing volumes:
+# https://clickhouse.com/docs/clickstack/deployment/all-in-one#persisting-data-and-settings
+storage:
+  clickhouse-data:
+    type: filesystem
+    description: |
+      ClickHouse data directory, holding all ingested logs, traces, metrics and sessions.
+      Size this for your retention before deploying: growing a persistent volume after the
+      fact requires manual intervention.
+  clickhouse-logs:
+    type: filesystem
+    description: ClickHouse server logs.
+  hyperdx-data:
+    type: filesystem
+    description: |
+      MongoDB data directory, holding HyperDX application state: user accounts, teams, API
+      keys, saved searches, dashboards and alerts.
+
+# This field populates the Resources tab on Charmhub.
+# https://documentation.ubuntu.com/charmcraft/stable/reference/files/charmcraft-yaml-file/#resources
+resources:
+  clickstack-image:
+    type: oci-image
+    description: |
+      OCI image bundling ClickHouse, the OpenTelemetry Collector, HyperDX and MongoDB.
+
+      This is the upstream Docker Hub image, not a rock: it is Alpine-based, is not built
+      reproducibly, and carries no Ubuntu security coverage. Replacing it with a rock is a
+      prerequisite for publishing this charm; see DESIGN.md.
+    upstream-source: clickhouse/clickstack-all-in-one@sha256:7b3bd9eec4e61aded56f705af7ddb2e8e49c54098d21aaaa7de6fde4d7c1f267  # renovate: oci-image tag: latest

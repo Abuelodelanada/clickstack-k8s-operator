@@ -1,0 +1,56 @@
+variable "app_name" {
+  description = "Name to give the deployed application"
+  type        = string
+  default     = "clickstack"
+}
+
+variable "base" {
+  description = "The operating system on which to deploy. E.g. ubuntu@24.04. Check Charmhub for per-charm base support."
+  type        = string
+  default     = "ubuntu@24.04"
+}
+
+variable "channel" {
+  description = "Channel that the charm is deployed from"
+  type        = string
+  default     = "latest/edge"
+}
+
+variable "config" {
+  description = "Map of the charm configuration options"
+  type        = map(string)
+  default     = {}
+}
+
+# We use constraints to set AntiAffinity in K8s
+# https://discourse.charmhub.io/t/pod-priority-and-affinity-in-juju-charms/4091/13
+variable "constraints" {
+  description = "String listing constraints for this application"
+  type        = string
+  # FIXME: Passing an empty constraints value to the Juju Terraform provider currently
+  # causes the operation to fail due to https://github.com/juju/terraform-provider-juju/issues/344
+  default = "arch=amd64"
+}
+
+variable "model_uuid" {
+  description = "Reference to an existing model resource or data source for the model to deploy to"
+  type        = string
+}
+
+variable "resources" {
+  description = "The charm's resources i.e., a resource revision number from CharmHub or a custom OCI image resource"
+  type        = map(string)
+  default     = {}
+}
+
+variable "revision" {
+  description = "Revision number of the charm"
+  type        = number
+  default     = null
+}
+
+variable "storage_directives" {
+  description = "Map of storage used by the application, which defaults to 1 GB each, allocated by Juju"
+  type        = map(string)
+  default     = {}
+}

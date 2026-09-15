@@ -1,0 +1,54 @@
+name: Pull Requests
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+      branches:
+        - main
+
+# NOTE: this is deliberately self-contained rather than calling
+# canonical/observability/.github/workflows/charm-pull-request.yaml@v2, because that reusable
+# workflow expects tox envs (static, unit, integration) and a tests/ tree that this repo does not
+# have yet. Switch to it once the test suite lands.
+
+jobs:
+  lint:
+    name: Lint and static analysis
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv tool install tox --with tox-uv
+      - run: tox -e lint
+
+  pack:
+    name: Pack the charm
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install charmcraft
+        run: sudo snap install charmcraft --classic
+      - name: Set up LXD
+        uses: canonical/setup-lxd@v0.1.1
+      - run: charmcraft pack --verbosity=verbose
+      - uses: actions/upload-artifact@v4
+        with:
+          name: charm
+          path: "*.charm"
+
+  terraform:
+    name: Validate the Terraform module
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      - run: terraform fmt -check -recursive
+        working-directory: terraform
+      - run: terraform init -backend=false
+        working-directory: terraform
+      - run: terraform validate
+        working-directory: terraform
