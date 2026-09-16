@@ -59,6 +59,8 @@ class Port(enum.IntEnum):
     clickhouse_http = 8123
     clickhouse_native = 9000
     """ClickHouse native protocol. Not opened on the unit: nothing outside needs it yet."""
+    mongodb = 27017
+    """MongoDB, holding HyperDX application state. Container-local."""
     opamp = 4320
     """OpAMP server the collector's supervisor talks to. Container-local."""
 
@@ -169,6 +171,9 @@ def pebble_layer(environment: dict[str, str]) -> LayerDict:
                 "working-dir": WORKING_DIR,
                 "startup": "enabled",
                 "environment": environment,
+                # MongoDB is the one component whose death `entry.sh` does not notice, so it
+                # needs an explicit remedy. See :func:`pebble_checks`.
+                "on-check-failure": {"mongodb-ready": "restart"},
             }
         },
         checks=pebble_checks(),
@@ -178,12 +183,25 @@ def pebble_layer(environment: dict[str, str]) -> LayerDict:
 def pebble_checks() -> dict[str, CheckDict]:
     """Build the Pebble checks for the workload container.
 
-    Both checks are deliberately ``ready`` and not ``alive``. A first boot runs ClickHouse
+    All three checks are ``ready`` and not ``alive``. A first boot runs ClickHouse
     initialisation, the collector's ClickHouse schema migrations and a Next.js cold start, which
-    together take minutes; an ``alive`` check would kill and restart the service part-way
-    through and never converge. ``ready`` lets the charm report ``maintenance`` while that
-    happens, and leaves crash detection to Pebble's own service restart logic, which works
-    because ``entry.sh`` exits when any component dies.
+    together take minutes; an ``alive`` check would kill and restart the service part-way through
+    and never converge. ``ready`` lets the charm report ``maintenance`` while that happens.
+
+    Crash *recovery* is therefore not uniform, because the workload's failure modes are not
+    uniform:
+
+    * ClickHouse and HyperDX are covered by ``entry.sh``'s ``wait -n``: if either dies the script
+      exits, and Pebble restarts the service.
+    * MongoDB is **not** covered. ``entry.sh`` starts ``mongod`` and then blocks in a loop waiting
+      for ClickHouse, so a ``mongod`` that dies during that window is reaped before ``wait -n`` is
+      ever reached. The stack then runs indefinitely with no database: static pages still render
+      and every port still answers, but nobody can log in. Observed in practice, where a restart
+      raced an orphaned ``mongod`` from the previous generation and lost with
+      "Failed to set up listener: SocketException: Address in use".
+
+      Hence the service's ``on-check-failure`` restarts the stack when this check fails, which is
+      what makes that failure self-healing rather than silent and permanent.
 
     Returns:
         Pebble check definitions, keyed by check name.
@@ -199,6 +217,17 @@ def pebble_checks() -> dict[str, CheckDict]:
             timeout="10s",
             threshold=3,
             http=HttpDict(url=f"http://localhost:{Port.clickhouse_http.value}/ping"),
+        ),
+        # mongod binds within seconds of service start, well before ClickHouse and HyperDX are
+        # up, so a comparatively tight threshold here does not clash with a slow first boot.
+        "mongodb-ready": CheckDict(
+            override="replace",
+            level="ready",
+            startup="enabled",
+            period="30s",
+            timeout="10s",
+            threshold=6,
+            tcp=TcpDict(port=Port.mongodb.value),
         ),
         # The UI root redirects to /login, so an HTTP check would see a 302 and fail. A TCP
         # check is enough to know the Next.js server finished starting.

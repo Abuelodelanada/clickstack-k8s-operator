@@ -14,6 +14,8 @@ requires-python = ">=3.12"
 # then inspect the libraries for dependencies specified in PYDEPS. List those dependencies here.
 dependencies = [
     "ops~=3.7",
+    # PYDEPS of lib/charms/traefik_k8s/v2/ingress.py
+    "pydantic",
 ]
 
 [dependency-groups]
@@ -43,6 +45,8 @@ branch = true
 
 [tool.coverage.report]
 show_missing = true
+# Vendored charm libraries are upstream code; we do not test them.
+omit = ["lib/charms/*"]
 
 [tool.pytest.ini_options]
 minversion = "6.0"
@@ -71,7 +75,7 @@ lint.ignore = [
     "D413",
 ]
 lint.per-file-ignores = {"tests/*" = ["D100","D101","D102","D103","D104"]}
-extend-exclude = ["__pycache__", "*.egg_info"]
+extend-exclude = ["__pycache__", "*.egg_info", "lib"]
 
 [tool.ruff.lint.mccabe]
 max-complexity = 10
@@ -82,4 +86,7 @@ skip = "build,lib,venv,icon.svg,.tox,.git,.mypy_cache,.ruff_cache,.coverage,uv.l
 [tool.pyright]
 # TODO: add "tests" once tests/ lands (DESIGN.md stage 1 follow-up).
 include = ["src"]
+# Vendored charm libraries are on the import path but are not ours to type-check.
+extraPaths = ["lib"]
+exclude = ["lib"]
 pythonVersion = "3.12"

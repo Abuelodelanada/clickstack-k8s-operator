@@ -16,8 +16,10 @@ container, so it cannot drift out of sync with reality.
 
 import logging
 from typing import cast
+from urllib.parse import urlparse
 
 import ops
+from charms.traefik_k8s.v2.ingress import IngressPerAppRequirer
 
 import clickstack
 
@@ -36,6 +38,20 @@ class ClickStackK8sCharm(ops.CharmBase):
         self.container = self.unit.get_container(clickstack.CONTAINER_NAME)
         self._config_error: str | None = None
 
+        # HyperDX terminates plain HTTP; when the ingress does TLS, it does so on our behalf, so
+        # the scheme we advertise as our backend is always http.
+        self.ingress = IngressPerAppRequirer(
+            self,
+            relation_name="ingress",
+            port=clickstack.Port.ui.value,
+            scheme="http",
+            # A no-op under the subdomain routing this charm requires, but it makes path-based
+            # routing fail at the assets rather than at the very first request, which is a
+            # marginally more diagnosable failure.
+            strip_prefix=True,
+            redirect_https=True,
+        )
+
         framework.observe(self.on.collect_unit_status, self._on_collect_unit_status)
         self._reconcile()
 
@@ -50,14 +66,30 @@ class ClickStackK8sCharm(ops.CharmBase):
     def _external_url(self) -> str:
         """URL at which users reach the HyperDX UI in a browser.
 
-        Falls back to the in-cluster Service address, which is only reachable from inside the
-        cluster. Users fronting the UI with an ingress must set ``external-url``, because
-        HyperDX bakes this value into the links it generates.
+        HyperDX bakes this into the links it generates, including the redirect after login, so
+        getting it wrong sends users to an address they cannot reach.
+
+        Precedence is ingress relation, then the `external-url` config option, then the
+        in-cluster Service address. The relation wins because it is derived from the ingress that
+        is actually routing the traffic, whereas the config option is a human's assertion that
+        can silently go stale.
         """
-        configured = cast(str, self.config.get("external-url") or "").strip().rstrip("/")
-        if configured:
+        if url := self.ingress.url:
+            return url.rstrip("/")
+        if configured := cast(str, self.config.get("external-url") or "").strip().rstrip("/"):
             return configured
         return f"http://{self._service_fqdn}:{clickstack.Port.ui.value}"
+
+    @property
+    def _ingress_path_prefix(self) -> str:
+        """Path prefix the ingress is routing this application under, if any.
+
+        A non-empty prefix means the ingress provider is in path-routing mode, which cannot
+        work here: see :meth:`_on_collect_unit_status`.
+        """
+        if not (url := self.ingress.url):
+            return ""
+        return urlparse(url).path.rstrip("/")
 
     # --- Configuration ----------------------------------------------------------------------
 
@@ -126,6 +158,9 @@ class ClickStackK8sCharm(ops.CharmBase):
             return
 
         self.unit.set_ports(*(port.value for port in clickstack.OPEN_PORTS))
+        # Published after set_ports, because the ingress library reports whether our port is
+        # actually open and Traefik uses that to decide whether to route to us at all.
+        self.ingress.provide_ingress_requirements(scheme="http", port=clickstack.Port.ui.value)
         self.container.add_layer(
             clickstack.SERVICE_NAME,
             clickstack.pebble_layer(environment),
@@ -162,6 +197,18 @@ class ClickStackK8sCharm(ops.CharmBase):
         """Report unit status, derived from the observable state of the workload."""
         if self._config_error:
             event.add_status(ops.BlockedStatus(self._config_error))
+
+        if prefix := self._ingress_path_prefix:
+            # HyperDX is a Next.js app built with basePath="", which is a build-time setting, so
+            # it can only ever serve from the root of a host. Under path routing the HTML
+            # document loads but every /_next/... asset 404s, giving a blank page and no clue
+            # why. Blocking with the fix is far kinder than reporting active.
+            event.add_status(
+                ops.BlockedStatus(
+                    f"ingress uses path routing ({prefix}); the UI cannot serve from a "
+                    "sub-path. Set routing_mode=subdomain and external_hostname on the ingress"
+                )
+            )
 
         if self.app.planned_units() > 1:
             # ClickHouse and MongoDB are pod-local in the all-in-one image, so extra units are

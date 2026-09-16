@@ -62,14 +62,75 @@ kubectl -n <model> port-forward svc/clickstack-k8s 8080:8080 4318:4318
 
 4. Search for `ClickStack ingestion test` in the **Search** view.
 
+## Accessing the UI from outside the cluster
+
+Relate to an ingress. Both `traefik-k8s` and `istio-ingress-k8s` provide the `ingress` interface
+this charm requires:
+
+```shell
+juju deploy traefik-k8s traefik --trust
+juju config traefik routing_mode=subdomain external_hostname=example.com
+juju integrate clickstack-k8s:ingress traefik:ingress
+```
+
+The charm feeds the URL it gets back into HyperDX's `FRONTEND_URL`, which is what stops the UI
+redirecting you to its in-cluster address after login.
+
+> [!IMPORTANT]
+> **The ingress must use subdomain (host-based) routing.** HyperDX is a Next.js application built
+> with `basePath: ""`, and `basePath` is a *build-time* setting — so HyperDX can only ever serve
+> from the root of a host. Under path routing the HTML document loads but every `/_next/...` asset
+> 404s, giving you a blank page with no explanation. The charm detects this and blocks:
+>
+> ```
+> ingress uses path routing (/mymodel-clickstack); the UI cannot serve from a
+> sub-path. Set routing_mode=subdomain and external_hostname on the ingress
+> ```
+>
+> Note `routing_mode` is a property of the *ingress* charm, not of this one, and `subdomain` mode
+> requires `external_hostname` to be a real DNS name rather than an IP address.
+
+Traefik then serves the app at `<model>-<app>.<external_hostname>`. Without real DNS you can test
+with `nip.io`, which resolves `*.<ip>.nip.io` to `<ip>`:
+
+```shell
+juju config traefik external_hostname=10.212.157.240.nip.io   # traefik's LoadBalancer IP
+curl -i http://mymodel-clickstack-k8s.10.212.157.240.nip.io/
+```
+
+### Without an ingress
+
+Set `external-url` by hand. Precedence is: `ingress` relation, then `external-url`, then the
+in-cluster Service address.
+
+```shell
+kubectl -n <model> port-forward --address 0.0.0.0 svc/clickstack-k8s 8080:8080 4318:4318
+juju config clickstack-k8s external-url=http://<vm-ip>:8080
+```
+
+`--address 0.0.0.0` matters if your cluster is in a VM and you are browsing from the host;
+`port-forward` binds to `127.0.0.1` by default.
+
 ## Configuration
+
 
 | Option                   | Type   | Default   | Purpose                                                        |
 | ------------------------ | ------ | --------- | -------------------------------------------------------------- |
-| `external-url`           | string | *(unset)* | Browser-reachable URL of the UI. HyperDX bakes it into generated links, so set it whenever the UI is fronted by an ingress. Defaults to the in-cluster Service address. |
+| `external-url`           | string | *(unset)* | Browser-reachable URL of the UI, used when there is no `ingress` relation. HyperDX bakes it into generated links. Overridden by the `ingress` relation. |
 | `clickhouse-endpoint`    | string | *(unset)* | HTTP(S) endpoint (including port) of an external ClickHouse, e.g. ClickHouse Cloud. When unset, the bundled ClickHouse is used. |
 | `clickhouse-user`        | string | `default` | Username for the external ClickHouse.                           |
 | `clickhouse-credentials` | secret | *(unset)* | Juju user secret with a `password` key, for the external ClickHouse. |
+
+## Relations
+
+| Endpoint  | Interface | Role     | Optional | Purpose                                     |
+| --------- | --------- | -------- | -------- | ------------------------------------------- |
+| `ingress` | `ingress` | requires | yes      | External access to the HyperDX UI on `8080`. |
+
+Note that only the **UI** is ingressed. The OTLP endpoints (`4317`/`4318`) are not, because the
+`ingress` interface carries a single port. Ingressing OTLP as well needs the multi-port
+`traefik_route` / `istio_ingress_route` interfaces — see [DESIGN.md](./DESIGN.md) stage 2.
+
 
 Using ClickHouse Cloud:
 

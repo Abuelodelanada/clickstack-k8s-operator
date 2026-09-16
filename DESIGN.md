@@ -60,6 +60,12 @@ Four facts from this drive the charm implementation:
    `CLICKHOUSE_ENDPOINT`, `CLICKHOUSE_USER`, `CLICKHOUSE_PASSWORD`, `DEFAULT_CONNECTIONS`,
    `DEFAULT_SOURCES`, `BETA_CH_OTEL_JSON_SCHEMA_ENABLED`, `CUSTOM_OTELCOL_CONFIG_FILE`,
    `OTLP_AUTH_TOKEN`, `OIDC_ISSUER_URL`/`OIDC_AUDIENCE`.
+5. **HyperDX cannot serve from a URL sub-path.** Verified from the running container:
+   `/app/packages/app/packages/app/.next/required-server-files.json` has `basePath: ""` and
+   `assetPrefix: ""`. In Next.js both are **build-time** settings with no runtime environment
+   override, so no charm config can change them. This single fact determines the entire ingress
+   design — see §4.2.
+
 
 ## 2. Prerequisites that are out of scope for this task
 
@@ -129,26 +135,36 @@ Scope:
   index digest.
 - One Pebble service, `clickstack`, running the image's own entrypoint (`sh /etc/local/entry.sh`)
   with `working-dir: /app` and the image's env restated explicitly.
-- Pebble readiness checks: `http` on `:8123/ping` (ClickHouse) and `tcp` on `:8080` (HyperDX).
-  Both `level: ready`, deliberately **not** `alive` — first boot runs ClickHouse schema migrations
-  and a Next.js cold start, and an `alive` check would kill the service mid-startup.
+- Pebble readiness checks: `http` on `:8123/ping` (ClickHouse), `tcp` on `:27017` (MongoDB) and
+  `tcp` on `:8080` (HyperDX). All `level: ready`, deliberately **not** `alive` — first boot runs
+  ClickHouse schema migrations and a Next.js cold start, and an `alive` check would kill the
+  service mid-startup. The MongoDB check additionally drives
+  `on-check-failure: {mongodb-ready: restart}`; see §5 for why that one component needs it.
 - Three Juju storages mounted at the three persistence paths.
 - Config: `external-url`, `clickhouse-endpoint`, `clickhouse-user`, `clickhouse-credentials`
   (a Juju user secret). Setting an external endpoint also rewrites `DEFAULT_CONNECTIONS` so the
   UI's seeded connection points at the external ClickHouse rather than the ignored local one.
+- One relation endpoint: `requires: ingress` (`ingress` interface, `limit: 1`, `optional: true`),
+  which feeds the resulting URL into `FRONTEND_URL`. See §4.2 for why this is the only interface
+  that works and why the charm blocks on path routing.
 - Holistic `_reconcile()` plus `collect-unit-status`, no per-event handlers.
 - `set_ports(8080, 4317, 4318, 8123)`.
 - Unit tests with `ops.testing` (`Context`/`State`), integration tests with `jubilant`.
 
-Explicitly out of Stage 1: relation endpoints, TLS, ingress, self-monitoring, actions, HA.
+Explicitly out of Stage 1: OTLP ingress, TLS, self-monitoring, actions, HA.
 
 ### Stage 2 — a real charm on a rock
 
 - Consume `clickstack-rock` with one Pebble service per component; drop the shell entrypoint.
 - `provides: receive-otlp` (`otlp` interface, matching `opentelemetry-collector-k8s`) — gated on
   solving the ingestion-key bootstrap (§2.3).
-- `requires: ingress` (`traefik_route` or `istio-ingress`), and feed the resulting external URL
-  into `FRONTEND_URL`. The UI is a browser app, so ingress is table stakes.
+- OTLP ingress. The `ingress` interface used in Stage 1 carries a **single port**, so it only
+  covers the UI. Ingressing `4317`/`4318` as well needs the multi-port interfaces —
+  `traefik_route` (submit your own Traefik dynamic config, one entrypoint per port) or
+  `istio_ingress_route` (declare your own listeners and routes). `opentelemetry-collector-k8s`
+  implements both in `src/integrations.py` and is the reference. Note those interfaces return only
+  `external_host` + `scheme`, not a URL, so the charm builds URLs itself — and they impose no path
+  prefix, which conveniently sidesteps §4.2 entirely.
 - TLS: `requires: certificates` + `receive-ca-cert`; render the collector's
   `standalone-auth-config.yaml`/TLS blocks and ClickHouse's TLS config.
 - Self-monitoring: `provides: grafana-dashboards-provider`,
@@ -197,13 +213,77 @@ computes the desired Pebble layer from config, pushes it with `combine=True`, op
 replans. Status is never set inline; it is derived in `collect-unit-status` from container
 connectivity, Pebble service state, and Pebble check state.
 
+### 4.2 Ingress: why `ingress`, and why subdomain routing is mandatory
+
+**The constraint.** HyperDX is a Next.js app built with `basePath: ""` (§1, fact 5). `basePath` is
+build-time, so HyperDX serves only from the root of a host. Neither of the two ways a charm can be
+served under a path prefix works:
+
+| | `strip_prefix` | HyperDX sees | Outcome |
+| --- | --- | --- | --- |
+| Workload serves the sub-path (the `grafana-k8s` design, `GF_SERVER_SERVE_FROM_SUB_PATH`) | `False` | `/mymodel-clickstack/...` | Next.js 404s every request — no `basePath` to match. |
+| Ingress strips, workload serves root (the `prometheus-k8s`/`alertmanager-k8s` design) | `True` | `/...` | HTML loads, then the browser requests `/_next/static/...` at the ingress root, which is not routed to us. Blank page. |
+
+Verified in-cluster with Traefik in `routing_mode=path`: `GET /cs-cs/` → `200`, but
+`GET /_next/static/chunks/polyfills-*.js` → `404`. Confirmed the second row exactly.
+
+**The decision.** Require the `ingress` interface (`traefik_k8s.v2.ingress.IngressPerAppRequirer`)
+and *detect* the unusable case rather than pretending to support it:
+
+- One endpoint serves both providers. `traefik-k8s` and `istio-ingress-k8s` both provide `ingress`,
+  so a single requirer works with either. This is why `ingress` was chosen over `traefik_route`,
+  which would have bound the charm to Traefik.
+- `strip_prefix=True`. A no-op under subdomain routing, and under path routing it at least gets the
+  HTML document served so the failure is visible in the browser's network tab rather than being a
+  bare 404.
+- **Routing mode is not ours to choose.** It is Traefik's model-wide `routing_mode` config
+  (`path`|`subdomain`); the `ingress` databag has no field for a requirer to request one. The only
+  way to know is to parse the URL we are handed. So `_ingress_path_prefix` does exactly that, and a
+  non-empty path yields `BlockedStatus` naming the prefix and the fix. Verified in-cluster: the unit
+  goes `blocked` on `routing_mode=path` and back to `active` on `subdomain`.
+- `subdomain` mode additionally requires Traefik's `external_hostname` to be a real DNS name, since
+  you cannot put a subdomain under an IP address.
+
+**URL precedence** is `ingress.url` → `external-url` config → in-cluster Service FQDN. The relation
+wins because it is derived from the ingress actually routing the traffic, whereas the config option
+is a human assertion that goes stale silently. This differs from `prometheus-k8s` and
+`alertmanager-k8s`, which deprecated their equivalent config option into a no-op; here it is
+retained as the supported no-ingress path (port-forward, NodePort), which is a real Stage 1
+workflow.
+
+**Library provenance.** `charms.traefik_k8s.v2.ingress` is Charmhub-hosted and has **no PyPI
+equivalent** (`charmlibs-interfaces-ingress` does not exist; `charmlibs/interfaces/ingress/` holds
+only the interface spec). It is therefore vendored at `lib/charms/traefik_k8s/v2/ingress.py` at
+`LIBPATCH 21`, with its `PYDEPS` (`pydantic`) added to `pyproject.toml`. `charmcraft fetch-lib`
+now prints a deprecation warning for all Charmhub libraries, so this file is a known piece of debt:
+if and when the ingress interface migrates to PyPI, drop `lib/` and add the dependency instead.
+By contrast `istio_ingress_route` and `service_mesh` *have* migrated
+(`charmlibs-interfaces-istio-ingress-route`, `charmlibs-interfaces-service-mesh`), which is
+relevant to the Stage 2 OTLP-ingress work above.
+
 ## 5. Known Stage 1 limitations
 
 - `entry.base.sh` appends to `/etc/hosts` on every start, so restarts accumulate duplicate
   `ch-server`/`db` lines. Harmless, but it is a symptom of running a Docker-shaped entrypoint
   under Pebble. Fixed by the rock.
-- Pebble sees one process. If ClickHouse dies, Pebble restarts *everything*, including MongoDB
-  and the UI. Fixed by the rock.
+- **Pebble sees one process, and `wait -n` does not cover MongoDB.** `entry.sh` starts `mongod`,
+  then blocks in a loop waiting for ClickHouse, and only reaches `wait -n` afterwards. A `mongod`
+  that dies inside that window is reaped before anything is watching, so the stack runs
+  indefinitely with no database: every port still answers and the UI still serves its static
+  pages, but nobody can log in.
+
+  This was observed, not theorised. After a `juju refresh`, `mongod` lost a race against an
+  orphaned `mongod` from the previous container generation and exited with
+  `Failed to set up listener: SocketException: Address in use` / `code:48`. The unit reported
+  `active` for as long as it took to notice by hand.
+
+  Mitigated in Stage 1 by a `mongodb-ready` TCP check plus
+  `on-check-failure: {mongodb-ready: restart}` on the service, which makes the failure both
+  visible in unit status and self-healing. It is a mitigation, not a fix: restarting the stack to
+  recover one component also bounces ClickHouse and the UI. Properly fixed by the rock, with one
+  Pebble service per component.
+- If ClickHouse or HyperDX dies, `wait -n` does fire, so Pebble restarts the service — but that
+  restarts *everything*, including MongoDB and the UI. Also fixed by the rock.
 - No log forwarding: components log to files under `/var/log/` inside the container, not stdout,
   so `juju debug-log` and Loki see nothing. Fixed by the rock.
 - First-boot is slow (ClickHouse init + schema migrations + Next.js). Expect a few minutes in
